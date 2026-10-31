@@ -41,16 +41,31 @@ TEXT_COLS = ["unit", "zona", "lantai", "status", "petugas", "catatan"]
 FMT_WAKTU = "%Y-%m-%d %H:%M:%S"
 
 # Daftar unit -> (zona, lantai). Ubah sesuai kondisi lapangan.
+# Pembagian sementara: 4 unit GF dan 4 unit UG.
+# Sesuaikan pemetaan ID unit setelah nomor fisik dikonfirmasi di lapangan.
 UNITS = {
-    "WCP-01": ("Koridor Utara", "Lantai 1"),
-    "WCP-02": ("Koridor Utara", "Lantai 1"),
-    "WCP-03": ("Koridor Selatan", "Lantai 1"),
-    "WCP-04": ("Koridor Selatan", "Lantai 1"),
-    "WCP-05": ("Koridor Utara", "Lantai 2"),
-    "WCP-06": ("Koridor Utara", "Lantai 2"),
-    "WCP-07": ("Koridor Selatan", "Lantai 2"),
-    "WCP-08": ("Koridor Selatan", "Lantai 2"),
+    "WCP-01": ("GF", "GF"),
+    "WCP-02": ("GF", "GF"),
+    "WCP-03": ("GF", "GF"),
+    "WCP-04": ("GF", "GF"),
+    "WCP-05": ("UG", "UG"),
+    "WCP-06": ("UG", "UG"),
+    "WCP-07": ("UG", "UG"),
+    "WCP-08": ("UG", "UG"),
 }
+
+LANTAI = ["GF", "UG"]
+
+
+def normalisasi_lantai(df: pd.DataFrame) -> pd.DataFrame:
+    """Baca label lama tanpa mengubah data asli yang sudah tersimpan."""
+    df = df.copy()
+    lama = {"Lantai 1": "GF", "Lantai 2": "UG",
+            "Lantai GF": "GF", "Lantai UG": "UG"}
+    df["lantai"] = df["lantai"].replace(lama)
+    # Format baru hanya mempunyai dua area; zona lama dikelompokkan per lantai.
+    df["zona"] = df["lantai"]
+    return df
 
 STATUS_OPTIONS = ["ON", "OFF", "FAULT"]
 WAKTU_CEK = [time(9, 0), time(13, 0), time(17, 0)]
@@ -76,7 +91,7 @@ def buat_data_contoh() -> pd.DataFrame:
         for i, jam in enumerate([9, 13, 17]):
             for u, (zona, lantai) in UNITS.items():
                 base = 25.0 + offset_jam[jam] + rng.normal(0, 0.5)
-                if lantai == "Lantai 2":
+                if lantai == "UG":
                     base += 0.4
                 r = rng.random()
                 status = "FAULT" if r < 0.04 else "OFF" if r < 0.08 else "ON"
@@ -123,7 +138,7 @@ def bersihkan(df: pd.DataFrame) -> pd.DataFrame:
     for c in TEXT_COLS:
         df[c] = df[c].fillna("").astype(str)
     df = df.dropna(subset=["waktu"] + NUM_COLS)
-    return df.reset_index(drop=True)
+    return normalisasi_lantai(df.reset_index(drop=True))
 
 
 def df_ke_values(df: pd.DataFrame) -> list:
@@ -238,8 +253,8 @@ def evaluasi_alarm(row, t_min, t_max, dt_min) -> str:
 # ------------------------------------------------------------------
 # SIDEBAR
 # ------------------------------------------------------------------
-st.sidebar.title("🌡️ Monitoring WCP/AC")
-st.sidebar.caption("Koridor Mall Lippo Plaza Sidoarjo")
+st.sidebar.title("🌡️ Monitoring Suhu")
+st.sidebar.caption("Lippo Plaza Sidoarjo · GF & UG")
 
 LIVE_OK = live_tersedia()
 
@@ -322,7 +337,7 @@ def halaman_input() -> None:
 
         unit = st.selectbox("Unit WCP/AC", list(UNITS.keys()))
         zona, lantai = UNITS[unit]
-        st.caption(f"Zona: **{zona}** · {lantai}")
+        st.caption(f"Area monitoring: **Lantai {lantai}**")
 
         c4, c5, c6, c7 = st.columns(4)
         status = c4.selectbox("Status", STATUS_OPTIONS)
@@ -433,166 +448,124 @@ _run_every = f"{interval}s" if (LIVE and auto_refresh) else None
 
 @st.fragment(run_every=_run_every)
 def halaman_dashboard() -> None:
-    st.title("📊 Dashboard Monitoring Temperature Area")
+    st.title("Monitoring Suhu Koridor")
+    st.caption("Lippo Plaza Sidoarjo · Lantai GF & UG")
     banner()
-    st.caption(
-        "Unit WCP/AC koridor · data dari checklist harian manual "
-        "(area belum memakai AC central/chiller)"
-    )
 
     df_all = ambil_data()
     if df_all.empty:
-        st.info("Belum ada data. Isi dulu lewat menu **Input Checklist**.")
+        st.info("Belum ada data. Mulai dari menu Input Checklist.")
         return
 
     df_all = tambah_delta_t(df_all)
-
-    # ---- Filter
-    f1, f2, f3 = st.columns([2, 1, 1])
     tgl_min = df_all["waktu"].min().date()
     tgl_max = df_all["waktu"].max().date()
-    rentang = f1.date_input(
-        "Rentang tanggal",
-        (max(tgl_min, tgl_max - timedelta(days=6)), tgl_max),
-        min_value=tgl_min, max_value=tgl_max,
+    col_tgl, col_lantai = st.columns([2, 1])
+    rentang = col_tgl.date_input(
+        "Periode", (max(tgl_min, tgl_max - timedelta(days=6)), tgl_max),
+        min_value=tgl_min, max_value=tgl_max, key="filter_periode"
     )
-    lantai_pilih = f2.multiselect(
-        "Lantai", sorted(df_all["lantai"].unique()),
-        default=sorted(df_all["lantai"].unique()),
+    lantai_pilih = col_lantai.selectbox(
+        "Tampilkan", ["Semua lantai", "GF", "UG"], key="filter_lantai"
     )
-    zona_pilih = f3.multiselect(
-        "Zona", sorted(df_all["zona"].unique()),
-        default=sorted(df_all["zona"].unique()),
-    )
-
     if isinstance(rentang, (tuple, list)):
-        if len(rentang) == 0:
-            awal, akhir = tgl_min, tgl_max
-        else:
-            awal, akhir = rentang[0], rentang[-1]
+        if not rentang:
+            st.info("Pilih tanggal awal dan akhir.")
+            return
+        awal, akhir = rentang[0], rentang[-1]
     else:
         awal = akhir = rentang
 
     df = df_all[
         (df_all["waktu"].dt.date >= awal)
         & (df_all["waktu"].dt.date <= akhir)
-        & (df_all["lantai"].isin(lantai_pilih))
-        & (df_all["zona"].isin(zona_pilih))
-    ]
+        & (df_all["lantai"].isin(LANTAI))
+    ].copy()
+    if lantai_pilih != "Semua lantai":
+        df = df[df["lantai"] == lantai_pilih].copy()
     if df.empty:
-        st.warning("Tidak ada data untuk filter yang dipilih.")
+        st.info("Tidak ada data untuk periode dan lantai ini.")
         return
 
-    # ---- Kondisi terbaru tiap unit
-    terbaru = (
-        df.sort_values("waktu").groupby("unit").tail(1).sort_values("unit").copy()
-    )
+    # Status menggunakan pemeriksaan TERAKHIR tiap unit, bukan rata-rata historis.
+    terbaru = df.sort_values("waktu").groupby("unit").tail(1).copy()
     terbaru["alarm"] = terbaru.apply(
         evaluasi_alarm, axis=1, args=(t_min, t_max, dt_min)
     )
+    pilihan = LANTAI if lantai_pilih == "Semua lantai" else [lantai_pilih]
 
-    unit_aktif = int((terbaru["status"] == "ON").sum())
-    unit_fault = int((terbaru["status"] == "FAULT").sum())
-    jml_alarm = int((~terbaru["alarm"].str.contains("Normal")).sum())
-    df_on = df[df["status"] == "ON"]
-    rata_suhu = df["suhu_koridor"].mean()
-    rata_dt = df_on["delta_t"].mean() if not df_on.empty else float("nan")
-    pct_target = (
-        ((df["suhu_koridor"] >= t_min) & (df["suhu_koridor"] <= t_max)).mean() * 100
-    )
+    st.subheader("Ringkasan per lantai")
+    kolom = st.columns(len(pilihan))
+    for box, lantai in zip(kolom, pilihan):
+        riwayat = df[df["lantai"] == lantai]
+        cek = terbaru[terbaru["lantai"] == lantai]
+        with box:
+            with st.container(border=True):
+                st.markdown(f"### Lantai {lantai}")
+                if riwayat.empty or cek.empty:
+                    st.caption("Belum ada pemeriksaan pada periode ini.")
+                    continue
+                # Suhu yang ditampilkan = pembacaan terbaru setiap unit.
+                suhu = cek["suhu_koridor"].mean()
+                normal = int((cek["alarm"] == "🟢 Normal").sum())
+                fault = int((cek["status"] == "FAULT").sum())
+                perlu = len(cek) - normal
+                st.metric("Suhu rata-rata terbaru", f"{suhu:.1f} °C")
+                st.caption(f"Target: {t_min:g}–{t_max:g} °C")
+                a, b, c = st.columns(3)
+                a.metric("Unit ON", int((cek["status"] == "ON").sum()))
+                b.metric("FAULT", fault)
+                c.metric("Perhatian", perlu)
+                if perlu:
+                    st.warning(f"{perlu} dari {len(cek)} unit perlu diperiksa.")
+                else:
+                    st.success("Semua unit dalam kondisi normal.")
+                st.caption(f"Cek terakhir: {cek['waktu'].max():%d/%m/%Y %H:%M} WIB")
 
-    # ---- KPI
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Rata-rata suhu koridor", f"{rata_suhu:.1f} °C")
-    k2.metric("Unit aktif (terbaru)", f"{unit_aktif}/{len(terbaru)}")
-    k3.metric("Unit FAULT", unit_fault)
-    k4.metric("Rata-rata ΔT (unit ON)", f"{rata_dt:.1f} °C")
-    k5.metric("Waktu dalam target", f"{pct_target:.0f}%")
-
-    if jml_alarm:
-        st.warning(f"⚠️ {jml_alarm} unit memerlukan perhatian pada pengecekan terakhir.")
-    else:
-        st.success("✅ Semua unit normal pada pengecekan terakhir.")
-
-    st.divider()
-
-    # ---- Tren suhu per zona
-    st.subheader("Tren suhu koridor")
-    tren = df.groupby(["waktu", "zona", "lantai"], as_index=False)["suhu_koridor"].mean()
-    tren["zona_lantai"] = tren["zona"] + " · " + tren["lantai"]
+    st.subheader("Tren suhu harian")
+    tren = df.copy()
+    tren["tanggal"] = tren["waktu"].dt.date
+    tren = tren.groupby(["tanggal", "lantai"], as_index=False)["suhu_koridor"].mean()
     fig = px.line(
-        tren, x="waktu", y="suhu_koridor", color="zona_lantai", markers=True,
-        labels={"waktu": "Waktu", "suhu_koridor": "Suhu (°C)", "zona_lantai": "Zona"},
+        tren, x="tanggal", y="suhu_koridor", color="lantai", markers=True,
+        category_orders={"lantai": LANTAI},
+        color_discrete_map={"GF": "#15803d", "UG": "#2563eb"},
+        labels={"tanggal": "Tanggal", "suhu_koridor": "Suhu (°C)", "lantai": "Lantai"},
     )
-    fig.add_hrect(
-        y0=t_min, y1=t_max, fillcolor="green", opacity=0.08, line_width=0,
-        annotation_text="Target", annotation_position="top left",
+    fig.add_hrect(y0=t_min, y1=t_max, fillcolor="#16a34a", opacity=0.08,
+                  line_width=0)
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=20, b=10),
+        legend_title_text="", hovermode="x unified",
+        xaxis_title="", yaxis_title="Suhu (°C)",
     )
-    fig.update_layout(height=380, legend_title_text="", margin=dict(t=30, b=10))
     st.plotly_chart(fig, width="stretch")
+    st.caption("Garis menunjukkan rata-rata seluruh pemeriksaan per hari. "
+               "Area berbayang menunjukkan rentang suhu target.")
 
-    # ---- ΔT dan status
-    g1, g2 = st.columns([3, 2])
-
-    with g1:
-        st.subheader("ΔT tiap unit (pengecekan terakhir)")
-        warna = terbaru["status"].map(
-            {"ON": "#2e7d32", "OFF": "#9e9e9e", "FAULT": "#c62828"}
-        )
-        figdt = go.Figure(
-            go.Bar(x=terbaru["unit"], y=terbaru["delta_t"], marker_color=warna,
-                   text=terbaru["delta_t"], textposition="outside")
-        )
-        figdt.add_hline(
-            y=dt_min, line_dash="dash", line_color="orange",
-            annotation_text=f"Min ΔT {dt_min}°C",
-        )
-        figdt.update_layout(height=340, yaxis_title="ΔT (°C)", margin=dict(t=30, b=10))
-        st.plotly_chart(figdt, width="stretch")
-
-    with g2:
-        st.subheader("Komposisi status")
-        status_count = df.groupby("status").size().reset_index(name="jumlah")
-        figpie = px.pie(
-            status_count, names="status", values="jumlah", hole=0.5,
-            color="status",
-            color_discrete_map={"ON": "#2e7d32", "OFF": "#9e9e9e", "FAULT": "#c62828"},
-        )
-        figpie.update_layout(height=340, margin=dict(t=30, b=10))
-        st.plotly_chart(figpie, width="stretch")
-
-    # ---- Heatmap
-    st.subheader("Heatmap suhu koridor per unit")
-    pivot = df.pivot_table(
-        index="unit", columns="waktu", values="suhu_koridor", aggfunc="mean"
-    )
-    pivot.columns = [c.strftime("%d/%m %H:%M") for c in pivot.columns]
-    fighm = px.imshow(
-        pivot, aspect="auto", color_continuous_scale="RdYlBu_r",
-        labels=dict(color="°C", x="Waktu", y="Unit"),
-    )
-    fighm.update_layout(height=340, margin=dict(t=10, b=10))
-    st.plotly_chart(fighm, width="stretch")
-
-    # ---- Tabel status
-    st.subheader("Status unit terbaru")
-    tabel = terbaru[
-        ["unit", "zona", "lantai", "waktu", "status", "suhu_koridor",
-         "suhu_supply", "suhu_return", "delta_t", "alarm", "catatan"]
+    st.subheader("Status unit terakhir")
+    tabel = terbaru.sort_values(["lantai", "unit"])[
+        ["lantai", "unit", "waktu", "status", "suhu_koridor",
+         "delta_t", "alarm", "catatan"]
     ].rename(columns={
-        "unit": "Unit", "zona": "Zona", "lantai": "Lantai", "waktu": "Cek terakhir",
-        "status": "Status", "suhu_koridor": "Koridor (°C)",
-        "suhu_supply": "Supply (°C)", "suhu_return": "Return (°C)",
+        "lantai": "Lantai", "unit": "Unit", "waktu": "Terakhir dicek",
+        "status": "Status", "suhu_koridor": "Suhu (°C)",
         "delta_t": "ΔT (°C)", "alarm": "Kondisi", "catatan": "Catatan",
     })
-    st.dataframe(tabel, width="stretch", hide_index=True)
-
-    st.download_button(
-        "⬇️ Unduh data terfilter (CSV)",
-        df.to_csv(index=False).encode("utf-8"),
-        file_name="monitoring_wcp_terfilter.csv",
-        mime="text/csv",
+    st.dataframe(
+        tabel, width="stretch", hide_index=True,
+        column_config={"Terakhir dicek": st.column_config.DatetimeColumn(
+            "Terakhir dicek", format="DD/MM/YYYY HH:mm"
+        )},
     )
+    with st.expander("Unduh data & informasi perhitungan"):
+        st.caption("Ringkasan dihitung dari pemeriksaan terakhir tiap unit "
+                   "pada periode terpilih. Grafik memakai rata-rata harian.")
+        st.download_button(
+            "Unduh data terfilter (CSV)",
+            df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="monitoring_suhu_gf_ug.csv", mime="text/csv",
+        )
 
 
 # ------------------------------------------------------------------
