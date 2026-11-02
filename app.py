@@ -7,6 +7,8 @@ Input manual dari checklist harian, dengan 2 mode:
 Jalankan:  streamlit run app.py
 """
 from datetime import date, datetime, time, timedelta
+import os
+import sqlite3
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -29,7 +31,7 @@ WIB = ZoneInfo("Asia/Jakarta")
 # Mode awal saat aplikasi dibuka: "demo" atau "live"
 DEFAULT_MODE = "demo"
 MODE_DEMO = "🧪 Demo (data contoh)"
-MODE_LIVE = "🟢 Live (Google Sheets)"
+MODE_LIVE = "🟢 Data Real (input lapangan)"
 
 COLUMNS = [
     "waktu", "unit", "zona", "lantai",
@@ -196,9 +198,57 @@ def _baca_live() -> pd.DataFrame:
     return bersihkan(pd.DataFrame(rec, columns=COLUMNS))
 
 
+
+def sqlite_path() -> str:
+    return os.environ.get("TEMP_AREA_DB", "monitoring_suhu.db")
+
+
+def sqlite_connect():
+    con = sqlite3.connect(sqlite_path(), timeout=20)
+    con.execute("PRAGMA busy_timeout = 20000")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS checklist ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "waktu TEXT NOT NULL, unit TEXT NOT NULL, zona TEXT, lantai TEXT, "
+        "suhu_koridor REAL, suhu_supply REAL, suhu_return REAL, "
+        "status TEXT, petugas TEXT, catatan TEXT)"
+    )
+    con.commit()
+    return con
+
+
+def _baca_sqlite() -> pd.DataFrame:
+    with sqlite_connect() as con:
+        return bersihkan(pd.read_sql_query(
+            "SELECT " + ", ".join(COLUMNS) + " FROM checklist ORDER BY id", con
+        ))
+
+
+def _tambah_sqlite(baris: dict) -> None:
+    values = df_ke_values(pd.DataFrame([baris], columns=COLUMNS))[0]
+    with sqlite_connect() as con:
+        con.execute(
+            "INSERT INTO checklist (" + ", ".join(COLUMNS) + ") VALUES ("
+            + ", ".join("?" for _ in COLUMNS) + ")", values
+        )
+        con.commit()
+
+
+def _ganti_sqlite(df: pd.DataFrame) -> None:
+    values = df_ke_values(df)
+    with sqlite_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM checklist")
+        con.executemany(
+            "INSERT INTO checklist (" + ", ".join(COLUMNS) + ") VALUES ("
+            + ", ".join("?" for _ in COLUMNS) + ")", values
+        )
+        con.commit()
+
+
 def muat_data(live: bool) -> pd.DataFrame:
     if live:
-        return _baca_live()
+        return _baca_live() if LIVE_OK else _baca_sqlite()
     if "demo_df" not in st.session_state:
         st.session_state["demo_df"] = buat_data_contoh()
     return st.session_state["demo_df"].copy()
@@ -207,8 +257,11 @@ def muat_data(live: bool) -> pd.DataFrame:
 def tambah_baris(live: bool, baris: dict) -> None:
     baru = pd.DataFrame([baris], columns=COLUMNS)
     if live:
-        _worksheet().append_row(df_ke_values(baru)[0], value_input_option="RAW")
-        _baca_live.clear()
+        if LIVE_OK:
+            _worksheet().append_row(df_ke_values(baru)[0], value_input_option="RAW")
+            _baca_live.clear()
+        else:
+            _tambah_sqlite(baris)
     else:
         st.session_state["demo_df"] = pd.concat(
             [muat_data(False), baru], ignore_index=True
@@ -218,10 +271,13 @@ def tambah_baris(live: bool, baris: dict) -> None:
 def simpan_semua(live: bool, df: pd.DataFrame) -> None:
     """Timpa seluruh data dengan df."""
     if live:
-        ws = _worksheet()
-        ws.clear()
-        ws.update(values=[COLUMNS] + df_ke_values(df), range_name="A1")
-        _baca_live.clear()
+        if LIVE_OK:
+            ws = _worksheet()
+            ws.clear()
+            ws.update(values=[COLUMNS] + df_ke_values(df), range_name="A1")
+            _baca_live.clear()
+        else:
+            _ganti_sqlite(df)
     else:
         st.session_state["demo_df"] = bersihkan(df)
 
@@ -258,14 +314,18 @@ st.sidebar.caption("Lippo Plaza Sidoarjo · GF & UG")
 
 LIVE_OK = live_tersedia()
 
-if LIVE_OK:
-    mode = st.sidebar.radio(
-        "Sumber data", [MODE_DEMO, MODE_LIVE], key="mode",
-        index=1 if DEFAULT_MODE == "live" else 0,
-    )
-else:
-    mode = st.sidebar.radio("Sumber data", [MODE_DEMO], key="mode")
-    st.sidebar.caption("Mode Live belum aktif: Google Sheets belum dikonfigurasi di *secrets*.")
+mode = st.sidebar.radio(
+    "Sumber data", [MODE_DEMO, MODE_LIVE], key="mode",
+    index=1 if DEFAULT_MODE == "live" else 0,
+)
+if mode == MODE_LIVE:
+    if LIVE_OK:
+        st.sidebar.success("Penyimpanan: Google Sheets")
+    else:
+        st.sidebar.warning(
+            "Penyimpanan: SQLite lokal. Di Streamlit Cloud, data dapat hilang "
+            "saat restart atau deployment. Unduh CSV secara berkala."
+        )
 
 LIVE = mode == MODE_LIVE
 
@@ -296,10 +356,14 @@ dt_min = st.sidebar.number_input(
 
 def banner() -> None:
     if LIVE:
-        st.success(
-            f"🟢 **MODE LIVE** · terhubung ke Google Sheets · "
-            f"diperbarui {sekarang():%H:%M:%S} WIB"
-        )
+        if LIVE_OK:
+            st.success("**DATA REAL** · Input pemeriksaan lapangan disimpan di Google Sheets.")
+        else:
+            st.warning(
+                "**DATA REAL · SQLITE LOKAL** — Data berasal dari input petugas, "
+                "bukan simulasi. Penyimpanan di Streamlit Community Cloud tidak "
+                "dijamin permanen. Unduh CSV untuk backup secara berkala."
+            )
     else:
         st.warning(
             "🧪 **MODE DEMO** · data di bawah adalah simulasi, bukan data hasil "
@@ -312,8 +376,8 @@ def ambil_data() -> pd.DataFrame:
         return muat_data(LIVE)
     except Exception as e:  # koneksi/izin/format sheet
         st.error(
-            "Gagal membaca Google Sheets. Cek *secrets*, ID spreadsheet, dan "
-            "pastikan sheet sudah dibagikan ke email service account.\n\n"
+            "Gagal membaca data. Jika memakai Google Sheets, cek *secrets* dan "
+            "pastikan akses service account sudah benar. Jika memakai SQLite, cek izin folder.\n\n"
             f"Detail: `{type(e).__name__}: {e}`"
         )
         st.stop()
@@ -387,7 +451,7 @@ def halaman_data() -> None:
     st.caption(
         "Ubah nilai langsung di tabel, hapus baris dengan memilihnya lalu tekan "
         "Delete, kemudian klik Simpan."
-        + (" **Di mode Live, ini menimpa isi Google Sheets.**" if LIVE else "")
+        + (" **Menyimpan perubahan akan mengganti data real.**" if LIVE else "")
     )
     edited = st.data_editor(
         df_all.sort_values("waktu", ascending=False).reset_index(drop=True),
@@ -415,7 +479,7 @@ def halaman_data() -> None:
     up = st.file_uploader("Unggah CSV (kolom harus sama)", type="csv")
     ok = True
     if LIVE:
-        ok = st.checkbox("Saya paham isi Google Sheets akan ditimpa file ini")
+        ok = st.checkbox("Saya paham data real akan diganti dengan isi CSV ini")
     if up is not None and st.button("Gunakan file ini", disabled=not ok):
         d = pd.read_csv(up)
         if set(COLUMNS).issubset(d.columns):
@@ -429,11 +493,7 @@ def halaman_data() -> None:
             st.error(f"Kolom harus ada: {', '.join(COLUMNS)}")
 
     if LIVE:
-        if df_all.empty and st.button("🧪 Isi Google Sheets dengan data contoh"):
-            simpan_semua(True, buat_data_contoh())
-            st.rerun()
-        elif not df_all.empty:
-            st.caption("Tombol data contoh hanya muncul jika Google Sheets masih kosong.")
+        st.caption("Data simulasi hanya tersedia pada Mode Demo, tidak dimasukkan ke Data Real.")
     else:
         if st.button("🔄 Reset ke data contoh"):
             st.session_state["demo_df"] = buat_data_contoh()
